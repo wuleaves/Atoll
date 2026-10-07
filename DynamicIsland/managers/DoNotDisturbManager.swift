@@ -69,6 +69,14 @@ final class DoNotDisturbManager: ObservableObject {
             self?.handleLogMetadataUpdate(identifier: identifier, name: name)
         }
 
+        focusLogStream.onStateUpdate = { [weak self] isActive in
+            guard let self else { return }
+            self.metadataExtractionQueue.async {
+                self.lastNotificationTimestamp = Date()
+                self.publishMetadata(identifier: nil, name: nil, isActive: isActive, source: "log-state")
+            }
+        }
+
         modeCancellable = Defaults.publisher(.focusMonitoringMode, options: [])
             .sink { [weak self] change in
                 guard let self else { return }
@@ -173,6 +181,7 @@ final class DoNotDisturbManager: ObservableObject {
                     withAnimation(.smooth(duration: 0.25)) {
                         self.isDoNotDisturbActive = isActive
                     }
+                    self.finishFocusStateChange(isActive: isActive)
                     // First activation with no prior mode: default to DND.
                     if isActive && previousIdentifier.isEmpty {
                         self.currentFocusModeIdentifier = FocusModeType.doNotDisturb.rawValue
@@ -244,7 +253,7 @@ final class DoNotDisturbManager: ObservableObject {
             }
 
             // If Focus remains active and the mode switches (e.g., DND -> Sleep), trigger an ON toast for the new mode.
-            if isActive == nil, previousActive == true, identifierChanged {
+            if isActive != false, previousActive == true, identifierChanged {
                 self.focusToastTrigger = UUID()
             }
 
@@ -258,23 +267,24 @@ final class DoNotDisturbManager: ObservableObject {
                 self.isDoNotDisturbActive = isActive
             }
 
-            // If Focus turned OFF, retain metadata briefly for the OFF toast,
-            // then clear it so stale state doesn't linger.
-            if isActive == false {
+            if !isActive {
                 self.currentFocusModeIdentifier = previousIdentifier
                 self.currentFocusModeName = previousName
-                self.scheduleMetadataClear()
-                self.beginFocusToastDismissIfNeeded()
-            } else {
-                // Focus turned ON — cancel any pending metadata clear and toast dismiss.
-                self.metadataClearTask?.cancel()
-                self.metadataClearTask = nil
-                self.cancelFocusToastDismiss()
             }
-
-            // Start or stop periodic verification based on new state.
-            self.updateStateVerification(focusActive: isActive)
+            self.finishFocusStateChange(isActive: isActive)
         }
+    }
+
+    private func finishFocusStateChange(isActive: Bool) {
+        if isActive {
+            metadataClearTask?.cancel()
+            metadataClearTask = nil
+            cancelFocusToastDismiss()
+        } else {
+            scheduleMetadataClear()
+            beginFocusToastDismissIfNeeded()
+        }
+        updateStateVerification(focusActive: isActive)
     }
 
     /// When focus is believed to be active, periodically verify the assertions
@@ -327,11 +337,11 @@ final class DoNotDisturbManager: ObservableObject {
               let root = (try? JSONSerialization.jsonObject(with: data, options: [])) as? [String: Any],
               let dataArray = root["data"] as? [[String: Any]],
               let firstItem = dataArray.first else {
-            // File unreadable/empty — assume focus is off.
-            return false
+            // A failed read is not evidence that Focus was disabled.
+            return true
         }
 
-        let assertions = (firstItem["storeAssertionRecords"] as? [Any]) ?? []
+        guard let assertions = firstItem["storeAssertionRecords"] as? [Any] else { return true }
         return !assertions.isEmpty
     }
 
@@ -526,7 +536,7 @@ private extension DoNotDisturbManager {
         guard isMonitoring else { return }
 
         if mode == .useDevTools {
-            stopAssertionsPolling()
+            startAssertionsPolling()
             focusLogStream.start()
             checkInitialFocusStateViaLog()
         } else {
@@ -568,8 +578,12 @@ private extension DoNotDisturbManager {
 
                 guard let lastLine = lines.last(where: { !$0.isEmpty }) else { continue }
 
-                // starting: 0 means focus ended — nothing to activate.
-                guard !lastLine.contains("starting: 0") else { return }
+                // A live notification received during this scan is newer than the history.
+                guard self.lastNotificationTimestamp == .distantPast else { return }
+                if FocusMetadataDecoder.extractActiveState(from: lastLine) == false {
+                    self.publishMetadata(identifier: nil, name: nil, isActive: false, source: "log-initial")
+                    return
+                }
 
                 let identifier = FocusMetadataDecoder.extractIdentifier(from: lastLine)
                 let name = FocusMetadataDecoder.extractName(from: lastLine)
@@ -616,27 +630,25 @@ private extension DoNotDisturbManager {
             return
         }
 
-        // Update last-observed modification date before reading content.
+        // Failed or partial writes must be retried on the next poll.
+        guard let data = try? Data(contentsOf: assertionsURL),
+              !data.isEmpty,
+              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let entries = root["data"] as? [[String: Any]],
+              let first = entries.first,
+              first["storeAssertionRecords"] is [Any] else { return }
+
+        // Record the modification date only after a successful read.
         if let attributes = try? FileManager.default.attributesOfItem(atPath: assertionsURL.path),
            let modifiedAt = attributes[.modificationDate] as? Date {
             lastAssertionsModificationDate = modifiedAt
         }
 
-        // Default to OFF — if the file can't be read or parsed, treat as no active focus.
-        var isActive = false
+        let assertions = first["storeAssertionRecords"] as? [Any] ?? []
+        let isActive = !assertions.isEmpty
         var identifier: String?
         var name: String?
-
-        if let data = try? Data(contentsOf: assertionsURL),
-           !data.isEmpty,
-           let root = (try? JSONSerialization.jsonObject(with: data, options: [])) as? [String: Any],
-           let dataArray = root["data"] as? [[String: Any]],
-           let firstItem = dataArray.first {
-
-            let assertions = (firstItem["storeAssertionRecords"] as? [Any]) ?? []
-            isActive = !assertions.isEmpty
-
-            if isActive {
+        if isActive {
                 let identifierKeys = [
                     "modeIdentifier",
                     "FocusModeIdentifier",
@@ -660,7 +672,6 @@ private extension DoNotDisturbManager {
 
                 identifier = firstMatch(for: identifierKeys, in: assertions)
                 name = firstMatch(for: nameKeys, in: assertions)
-            }
         }
 
         publishMetadata(identifier: identifier, name: name, isActive: isActive, source: "assertions-poll")
@@ -1123,6 +1134,7 @@ private final class FocusLogStream {
     private var lastName: String?
 
     var onMetadataUpdate: ((String?, String?) -> Void)?
+    var onStateUpdate: ((Bool) -> Void)?
 
     func start() {
         queue.async { [weak self] in
@@ -1245,9 +1257,10 @@ private final class FocusLogStream {
             debugPrint("[FocusLogStream] log stream error: \(trimmed)")
         }
 
-        // Clear only when logs explicitly indicate no active mode (helps avoid wiping state during transitions).
-        if trimmed.contains("active mode assertion: (null)") || trimmed.contains("activeModeIdentifier: (null)") {
+        let activeState = FocusMetadataDecoder.extractActiveState(from: trimmed)
+        if activeState == false {
             clearMetadata()
+            onStateUpdate?(false)
             return
         }
 
@@ -1277,13 +1290,17 @@ private final class FocusLogStream {
             updatedName = name
         }
 
-        guard updatedIdentifier != nil || updatedName != nil else { return }
+        guard updatedIdentifier != nil || updatedName != nil else {
+            if let activeState { onStateUpdate?(activeState) }
+            return
+        }
 
         var identifierToSend: String?
         var nameToSend: String?
 
         metadataLock.lock()
         if let identifier = updatedIdentifier, !identifier.isEmpty {
+            if identifier != lastIdentifier { lastName = nil }
             lastIdentifier = identifier
         }
 
@@ -1296,6 +1313,7 @@ private final class FocusLogStream {
         metadataLock.unlock()
 
         notifyMetadataUpdate(identifier: identifierToSend, name: nameToSend)
+        if let activeState { onStateUpdate?(activeState) }
     }
 
     private func clearMetadata() {
@@ -1358,6 +1376,16 @@ private enum FocusNotificationParsing {
 }
 
 private enum FocusMetadataDecoder {
+    /// Only explicit transition records change state; metadata and stream termination do not.
+    static func extractActiveState(from description: String) -> Bool? {
+        if description.contains("active mode assertion: (null)") || description.contains("activeModeIdentifier: (null)") {
+            return false
+        }
+        guard description.contains("semanticModeIdentifier"),
+              let range = description.range(of: #"\bstarting:\s*[01]\b"#, options: .regularExpression) else { return nil }
+        return description[range].trimmingCharacters(in: .whitespaces).hasSuffix("1")
+    }
+
     static func cleanedString(_ string: String) -> String {
         var trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
         trimmed = trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "'\""))

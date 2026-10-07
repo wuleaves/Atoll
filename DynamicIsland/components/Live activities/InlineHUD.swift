@@ -65,15 +65,22 @@ private struct LoopingVideoIcon: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        // No-op; the animation loops via AVPlayerLooper.
+        nsView.frame.size = size
+        if let layer = nsView.layer?.sublayers?.first as? AVPlayerLayer {
+            layer.frame = nsView.bounds
+            context.coordinator.attach(layer: layer, url: url)
+        }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     final class Coordinator {
         private var controller: LoopingPlayerController?
+        private var currentURL: URL?
 
         func attach(layer: AVPlayerLayer, url: URL) {
+            guard currentURL != url else { return }
+            currentURL = url
             controller = LoopingPlayerController(url: url)
             layer.player = controller?.player
         }
@@ -83,9 +90,10 @@ private struct LoopingVideoIcon: NSViewRepresentable {
 struct AirPodsListeningModeSymbol: View {
     let mode: AirPodsListeningMode
     var size: CGFloat = 15
+    @ObservedObject private var bluetoothManager = BluetoothAudioManager.shared
 
     var body: some View {
-        Image(systemName: mode.sfSymbol)
+        Image(systemName: mode == .off ? (bluetoothManager.hudDevice?.deviceType.sfSymbol ?? "headphones") : mode.sfSymbol)
             .font(.system(size: size, weight: .medium))
             .symbolRenderingMode(.hierarchical)
             .contentTransition(.symbolEffect)
@@ -130,7 +138,7 @@ struct InlineHUD: View {
     
     var body: some View {
         let useCircularIndicator = useCircularBluetoothBatteryIndicator
-        let listeningModeEvent = bluetoothManager.activeListeningModeEvent
+        let listeningModeEvent = type == .bluetoothAudio && value < 0 ? bluetoothManager.activeListeningModeEvent : nil
         let listeningMode = listeningModeEvent?.mode ?? (type == .bluetoothAudio && value < 0 ? AirPodsListeningMode.fromHUDSymbol(icon) : nil)
         let isListeningModeEvent = type == .bluetoothAudio && listeningMode != nil
         let hasBatteryLevel = value > 0 && !isListeningModeEvent
@@ -277,12 +285,12 @@ struct InlineHUD: View {
                                     .contentTransition(.interpolate)
                                     .frame(width: 20, height: 15, alignment: .center)
                             } else if useBluetoothHUD3DIcon,
-                               let deviceType = bluetoothManager.lastConnectedDevice?.deviceType,
+                               let deviceType = bluetoothManager.hudDevice?.deviceType,
                                let url = deviceType.inlineHUDAnimationURL {
                                 LoopingVideoIcon(url: url, size: CGSize(width: 20, height: 20))
                                     .frame(width: 20, height: 20, alignment: .center)
                             } else {
-                                Image(systemName: icon.isEmpty ? "dot.radiowaves.left.and.right" : icon)
+                                Image(systemName: bluetoothManager.hudDevice?.deviceType.sfSymbol ?? (icon.isEmpty ? "headphones" : icon))
                                     .symbolRenderingMode(.hierarchical)
                                     .contentTransition(.interpolate)
                                     .frame(width: 20, height: 15, alignment: .center)
@@ -460,7 +468,7 @@ struct InlineHUD: View {
         .onChange(of: type) { _, _ in
             displayName = Type2Name(type)
         }
-        .onChange(of: bluetoothManager.lastConnectedDevice?.name) { _, _ in
+        .onChange(of: bluetoothManager.hudDevice?.name) { _, _ in
             displayName = Type2Name(type)
         }
     }
@@ -574,7 +582,7 @@ struct InlineHUD: View {
             case .mic:
                 return String(localized: "Mic")
             case .bluetoothAudio:
-                return BluetoothAudioManager.shared.lastConnectedDevice?.name ?? "Bluetooth"
+                return bluetoothManager.hudDevice?.name ?? "Bluetooth"
             case .capsLock:
                 return String(localized: "Caps Lock")
             default:

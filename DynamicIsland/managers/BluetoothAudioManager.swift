@@ -33,6 +33,7 @@ class BluetoothAudioManager: ObservableObject {
     @Published var lastConnectedDevice: BluetoothAudioDevice?
     @Published var connectedDevices: [BluetoothAudioDevice] = []
     @Published var isBluetoothAudioConnected: Bool = false
+    @Published private(set) var hudDevice: BluetoothAudioDevice?
     @Published private(set) var activeListeningModeEvent: AirPodsListeningModeEvent?
     
     // MARK: - Private Properties
@@ -103,7 +104,7 @@ class BluetoothAudioManager: ObservableObject {
     private let hudBatteryWaitInterval: TimeInterval = 0.3
     private let hudBatteryWaitTimeout: TimeInterval = 1.8
     private var listeningModeClearTask: Task<Void, Never>?
-    private var listeningModePresentationTask: Task<Void, Never>?
+    private var listeningModePresentationTasks: [String: Task<Void, Never>] = [:]
     private var lastListeningModeByAddress: [String: AirPodsListeningMode] = [:]
     private var listeningModeRefreshTask: Task<Void, Never>?
     private let listeningModeLogObserver = AirPodsListeningModeLogObserver()
@@ -405,8 +406,8 @@ class BluetoothAudioManager: ObservableObject {
             if let normalizedAddress {
                 return normalizeBluetoothIdentifier(candidate.address) == normalizedAddress
             }
-            return true
-        } ?? primaryConnectedAirPodsDevice()
+            return false
+        } ?? (address == nil ? primaryConnectedAirPodsDevice() : nil)
 
         guard let device else { return }
         presentListeningModeIfChanged(AirPodsListeningModeEvent(device: device, mode: mode))
@@ -847,7 +848,7 @@ class BluetoothAudioManager: ObservableObject {
             if lowercaseName.contains("solo") {
                 return .beatssolo
             }
-            return .beatssolo
+            return .beats
         } else if lowercaseName.contains("speaker") || lowercaseName.contains("boombox") {
             return .speaker
         } else if lowercaseName.contains("headphone") || lowercaseName.contains("headset") || 
@@ -1939,6 +1940,9 @@ class BluetoothAudioManager: ObservableObject {
     private func presentDeviceConnectedHUD(device: BluetoothAudioDevice, batteryLevel: Int?) {
         guard Defaults[.showBluetoothDeviceConnections] else { return }
 
+        hudDevice = device
+        activeListeningModeEvent = nil
+        listeningModeClearTask?.cancel()
         print("🎧 [BluetoothAudioManager] 📱 Showing device connected HUD")
 
         let batteryValue: CGFloat = if let batteryLevel {
@@ -1962,21 +1966,20 @@ class BluetoothAudioManager: ObservableObject {
 
     private func scheduleEventDrivenListeningModeRefresh(reason: String) {
         listeningModeRefreshTask?.cancel()
-        listeningModeRefreshTask = Task.detached(priority: .utility) { [weak self] in
+        // Resolve the device on the main thread; read its registry entry off the UI thread.
+        listeningModeRefreshTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 180_000_000)
-            guard let self, !Task.isCancelled else { return }
-
-            await MainActor.run {
-                guard let device = self.primaryConnectedAirPodsDevice(),
-                      let mode = self.readListeningModeViaDynamicSelectors(for: device) ??
-                        Self.readListeningModeFromIORegistry() else {
-                    return
-                }
-
-                self.presentListeningModeIfChanged(
-                    AirPodsListeningModeEvent(device: device, mode: mode)
-                )
-            }
+            guard let self, !Task.isCancelled,
+                  let device = self.primaryConnectedAirPodsDevice() else { return }
+            let address = device.address
+            let mode = await Task.detached(priority: .utility) {
+                Self.readListeningModeFromIORegistry(address: address)
+            }.value
+            guard !Task.isCancelled, let mode,
+                  self.connectedDevices.contains(where: {
+                      self.normalizeBluetoothIdentifier($0.address) == self.normalizeBluetoothIdentifier(address)
+                  }) else { return }
+            self.presentListeningModeIfChanged(AirPodsListeningModeEvent(device: device, mode: mode))
         }
     }
 
@@ -1984,11 +1987,11 @@ class BluetoothAudioManager: ObservableObject {
         guard Defaults[.showAirPodsListeningModeChanges] else { return }
         guard event.device.deviceType.isAirPods else { return }
 
-        let address = event.device.address
+        let address = normalizeBluetoothIdentifier(event.device.address)
+        // A return to the current mode must cancel a pending, obsolete transition.
+        listeningModePresentationTasks.removeValue(forKey: address)?.cancel()
         guard lastListeningModeByAddress[address] != event.mode else { return }
-
-        listeningModePresentationTask?.cancel()
-        listeningModePresentationTask = Task { @MainActor [weak self] in
+        listeningModePresentationTasks[address] = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 350_000_000)
             guard !Task.isCancelled else { return }
             self?.presentStableListeningMode(event)
@@ -1999,9 +2002,11 @@ class BluetoothAudioManager: ObservableObject {
         guard Defaults[.showAirPodsListeningModeChanges] else { return }
         guard event.device.deviceType.isAirPods else { return }
 
-        let address = event.device.address
-        guard lastListeningModeByAddress[address] != event.mode else { return }
+        let address = normalizeBluetoothIdentifier(event.device.address)
+        guard connectedDevices.contains(where: { normalizeBluetoothIdentifier($0.address) == address }),
+              lastListeningModeByAddress[address] != event.mode else { return }
         lastListeningModeByAddress[address] = event.mode
+        hudDevice = event.device
         activeListeningModeEvent = event
 
         print("🎧 [BluetoothAudioManager] 🎚️ AirPods listening mode changed: \(event.mode.displayName)")
@@ -2057,39 +2062,9 @@ class BluetoothAudioManager: ObservableObject {
     }
 
     private func primaryConnectedAirPodsDevice() -> BluetoothAudioDevice? {
-        if let device = lastConnectedDevice, device.deviceType.isAirPods {
-            return device
-        }
-
-        return connectedDevices.first { $0.deviceType.isAirPods }
-    }
-
-    private func readListeningModeViaDynamicSelectors(for device: BluetoothAudioDevice) -> AirPodsListeningMode? {
-        guard let ioDevice = ioBluetoothDevice(for: device) else { return nil }
-        let selectors = [
-            "listeningMode",
-            "LsnM",
-            "noiseControlMode",
-            "activeNoiseControlMode",
-            "activeNoiseCancellationMode",
-            "ancMode",
-            "bluetoothListeningMode",
-            "adaptiveAudioMode",
-            "conversationAwarenessMode"
-        ]
-
-        for selectorName in selectors {
-            let selector = NSSelectorFromString(selectorName)
-            guard ioDevice.responds(to: selector),
-                  let value = ioDevice.perform(selector)?.takeUnretainedValue(),
-                  let mode = AirPodsListeningMode.from(value) else {
-                continue
-            }
-
-            return mode
-        }
-
-        return nil
+        let devices = connectedDevices.filter { $0.deviceType.isAirPods }
+        // An addressless update cannot safely be attributed when multiple pairs are connected.
+        return devices.count == 1 ? devices.first : nil
     }
 
     private func ioBluetoothDevice(for device: BluetoothAudioDevice) -> IOBluetoothDevice? {
@@ -2103,43 +2078,39 @@ class BluetoothAudioManager: ObservableObject {
         }
     }
 
-    private static func readListeningModeFromIORegistry() -> AirPodsListeningMode? {
+    private static func readListeningModeFromIORegistry(address: String) -> AirPodsListeningMode? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/ioreg")
-        process.arguments = ["-r", "-l", "-w", "0"]
-
+        process.arguments = ["-a", "-r", "-l", "-w", "0"]
         let pipe = Pipe()
         process.standardOutput = pipe
-        process.standardError = Pipe()
-
-        do {
-            try process.run()
-        } catch {
-            return nil
-        }
-
-        process.waitUntilExit()
-
-        guard process.terminationStatus == 0 else { return nil }
-
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return nil }
+        // Drain before waiting: a full pipe otherwise deadlocks the subprocess.
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard let output = String(data: data, encoding: .utf8) else { return nil }
-
-        let interestingLines = output
-            .components(separatedBy: .newlines)
-            .filter {
-                let lowercased = $0.lowercased()
-                return lowercased.contains("airpods") ||
-                    lowercased.contains("listening") ||
-                    lowercased.contains("noise") ||
-                    lowercased.contains("transparency") ||
-                    lowercased.contains("adaptive") ||
-                    lowercased.contains("conversation")
+        process.waitUntilExit()
+        guard process.terminationStatus == 0,
+              let root = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) else { return nil }
+        func normalized(_ value: String) -> String {
+            value.lowercased().filter { $0.isHexDigit }
+        }
+        let target = normalized(address)
+        guard target.count == 12 else { return nil }
+        func find(_ value: Any) -> AirPodsListeningMode? {
+            if let nodes = value as? [Any] {
+                return nodes.lazy.compactMap { find($0) }.first
             }
-
-        return AirPodsListeningMode.from(interestingLines.joined(separator: "\n"))
+            guard let node = value as? [String: Any] else { return nil }
+            let addressKeys = ["BluetoothDeviceAddress", "DeviceAddress", "BD_ADDR", "Address"]
+            if addressKeys.contains(where: { key in
+                guard let candidate = node[key] as? String else { return false }
+                return normalized(candidate) == target
+            }), let mode = AirPodsListeningMode.from(userInfo: node) { return mode }
+            return node.values.lazy.compactMap { find($0) }.first
+        }
+        return find(root)
     }
-    
+
     // MARK: - Cleanup
     
     private func cleanup() {
@@ -2156,7 +2127,8 @@ class BluetoothAudioManager: ObservableObject {
         hudBatteryWaitTasks.removeAll()
         listeningModeRefreshTask?.cancel()
         listeningModeClearTask?.cancel()
-        listeningModePresentationTask?.cancel()
+        listeningModePresentationTasks.values.forEach { $0.cancel() }
+        listeningModePresentationTasks.removeAll()
         listeningModeLogObserver.stop()
 
         let darwinCenter = CFNotificationCenterGetDarwinNotifyCenter()
@@ -2247,7 +2219,9 @@ private final class AirPodsListeningModeLogObserver {
            value.contains("supported") ||
            value.contains("capability") ||
            value.contains("capabilities") ||
-           value.contains("listening modes") {
+           value.contains("listening modes") ||
+           value.contains("request") || value.contains("query") ||
+           value.contains("sending") {
             return false
         }
 
@@ -2612,21 +2586,10 @@ enum AirPodsListeningMode: Equatable {
     static func from(userInfo: [AnyHashable: Any]?) -> AirPodsListeningMode? {
         guard let userInfo else { return nil }
 
-        let modeKeys = [
-            "listeningMode",
-            "ListeningMode",
-            "noiseControlMode",
-            "NoiseControlMode",
-            "activeNoiseControlMode",
-            "ANCMode",
-            "ancMode",
-            "adaptiveAudioMode",
-            "AdaptiveAudioMode",
-            "conversationAwareness",
-            "ConversationAwareness",
-            "conversationDetect",
-            "ConversationDetect"
-        ]
+        // Feature flags (adaptive audio/conversation awareness) are independent of ANC.
+        let modeKeys = ["listeningMode", "ListeningMode", "LsnM", "noiseControlMode",
+                        "NoiseControlMode", "activeNoiseControlMode", "activeNoiseCancellationMode",
+                        "ANCMode", "ancMode"]
 
         for key in modeKeys {
             if let value = userInfo[key], let mode = from(value) {
@@ -2634,7 +2597,7 @@ enum AirPodsListeningMode: Equatable {
             }
         }
 
-        return from(userInfo.map { "\($0.key)=\($0.value)" }.joined(separator: " "))
+        return nil
     }
 
     static func from(_ value: Any) -> AirPodsListeningMode? {
@@ -2643,6 +2606,8 @@ enum AirPodsListeningMode: Equatable {
         }
 
         if let number = value as? NSNumber {
+            guard CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  number.doubleValue == Double(number.intValue) else { return nil }
             return fromPrivateValue(number.intValue)
         }
 
@@ -2671,55 +2636,28 @@ enum AirPodsListeningMode: Equatable {
     }
 
     private static func from(_ rawValue: String) -> AirPodsListeningMode? {
-        let value = rawValue.lowercased()
-
-        if value.contains("lsnm anc") || value.contains("listeningmode anc") || value == "anc" {
-            return .noiseCancellation
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        func exact(_ token: String) -> AirPodsListeningMode? {
+            switch token {
+            case "0", "off", "normal": return .off
+            case "1", "anc", "noisecancellation", "noise cancellation", "noise cancelling", "noisecancelling": return .noiseCancellation
+            case "2", "transparency", "transparent", "ambient": return .transparency
+            case "3", "autoanc", "adaptive", "adaptive audio": return .adaptive
+            case "4", "conversation awareness": return .conversationAwareness
+            default: return nil
+            }
         }
-
-        if value.contains("lsnm transparency") || value == "transparency" {
-            return .transparency
-        }
-
-        if value.contains("lsnm autoanc") || value.contains("autoanc") {
-            return .adaptive
-        }
-
-        if value.contains("lsnm normal") || value == "normal" {
-            return .off
-        }
-
-        if value.contains("conversation") || value.contains("conversational") {
-            return .conversationAwareness
-        }
-
-        if value.contains("adaptive") {
-            return .adaptive
-        }
-
-        if value.contains("transparency") || value.contains("transparent") || value.contains("ambient") {
-            return .transparency
-        }
-
-        if value.contains("noise cancellation") ||
-           value.contains("noisecancellation") ||
-           value.contains("noise cancelling") ||
-           value.contains("noisecancelling") ||
-           value.contains("anc") {
-            return .noiseCancellation
-        }
-
-        if value.contains("listeningmode = 0") ||
-           value.contains("listeningmode=0") ||
-           value.contains("noisecontrolmode = 0") ||
-           value.contains("noisecontrolmode=0") ||
-           value.contains(" off") ||
-           value.hasSuffix("off") {
-            return .off
-        }
-
-        return nil
+        if let mode = exact(value) { return mode }
+        // Parse a current-value field, never a substring of a property name or device name.
+        // For transition logs use the destination rather than the old mode.
+        let pattern = #"\b(?:lsnm|listeningmode|noisecontrolmode|activenoisecontrolmode|activenoisecancellationmode|ancmode)\b[\s"']*[:=]?\s*["']?(autoanc|anc|normal|off|transparency|adaptive|noise cancellation|noisecancellation|noise cancelling|[0-4])\b(?:\s*(?:->|=>)\s*(autoanc|anc|normal|off|transparency|adaptive|noise cancellation|noisecancellation|noise cancelling|[0-4])\b)?"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.matches(in: value, range: NSRange(value.startIndex..., in: value)).last else { return nil }
+        let group = match.range(at: 2).location == NSNotFound ? 1 : 2
+        guard let range = Range(match.range(at: group), in: value) else { return nil }
+        return exact(String(value[range]))
     }
+
 }
 
 extension BluetoothAudioDevice {
@@ -2749,6 +2687,11 @@ enum BluetoothAudioDeviceType {
     case generic
     
     var sfSymbol: String {
+        let candidates = [preferredSFSymbol, isAirPods ? "airpods" : "headphones", "headphones"]
+        return candidates.first { NSImage(systemSymbolName: $0, accessibilityDescription: nil) != nil } ?? "headphones"
+    }
+
+    private var preferredSFSymbol: String {
         switch self {
         case .airpods:
             return "airpods"
@@ -2796,7 +2739,17 @@ enum BluetoothAudioDeviceType {
 
     /// Inline HUD only: base filename (no extension) for a looping .mov animation.
     var inlineHUDAnimationBaseName: String {
-        String(describing: self)
+        switch self {
+        case .airpods: return "airpods"
+        case .airpodsGen3: return "airpodsGen3"
+        case .airpodsGen4: return "airpodsGen4"
+        case .airpodsPro: return "airpodsPro"
+        case .airpodsPro3: return "airpodsPro3"
+        case .airpodsMax: return "airpodsMax"
+        case .beatsstudio: return "beatsstudio"
+        case .beatssolo: return "beatssolo"
+        default: return "" // No matching movie: use this device's symbol.
+        }
     }
 }
 
